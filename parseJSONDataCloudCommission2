@@ -1,0 +1,170 @@
+/**
+ * @description Classe Apex para processar um JSON complexo (com o padrão {"type": "...", "value": "..."}) 
+ * recebido de outra classe Apex (ConfiguredSchemaExtractor) e criar registros CommissionStatementLineItem.
+ * Inclui tratamento para formatos numéricos e de data brasileiros.
+ */
+public with sharing class parseJSONDataCloudCommission2 {
+
+    /** Estrutura auxiliar para o padrão {"type": "...", "value": "..."} */
+    public class JsonValue {
+        public String type;
+        public String value;
+    }
+
+    /** Estrutura para os dados reais de cada item de linha de comissão */
+    public class CommissionLineItemData { 
+        public JsonValue PaymentDate;
+        public JsonValue PolicyNumber;
+        public JsonValue EndorssementNumber;
+        public JsonValue InstallmentNumber;
+        public JsonValue CommissionPercent;
+        public JsonValue CommissionType;
+        public JsonValue ValueAmount;
+        public JsonValue PremiumCurrencyISOCode;
+        public JsonValue CommissionCurrencyISOCode;
+        public JsonValue CustomerName;
+        
+        // public JsonValue customLineItemField; // Exemplo de campo não-standard (comentado)
+    }
+    
+    /** Estrutura que mapeia o objeto {"type": "object", "value": {DATA_REAL}} */
+    public class CommissionLineItemInnerWrapper {
+        public String type; // Mapeia "type": "object"
+        public CommissionLineItemData value; // Mapeia a classe de dados real
+    }
+
+    /** Estrutura para o array 'CommissionLineItems' */
+    public class CommissionLineItemWrapper {
+        public String type;
+        public List<CommissionLineItemInnerWrapper> value;
+    }
+
+    /** Estrutura principal que representa o JSON completo (Cabeçalho + Linhas) */
+    public class CommissionStatementWrapper {
+        public JsonValue CarrierName;
+        public JsonValue ReceiptNumber;
+        public JsonValue LegalEntity;
+        public JsonValue LegalEntityDocument;
+        public JsonValue InsuranceNumberLegalEntity;
+        public CommissionLineItemWrapper CommissionLineItems;
+        
+        // public JsonValue customHeaderField; // Exemplo de campo não-standard (comentado)
+    }
+    
+    // -------------------------------------------------------------------------
+    // 2. MÉTODO DE PROCESSAMENTO PRINCIPAL (CHAMADO POR ConfiguredSchemaExtractor)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Método principal estático chamado pela classe ConfiguredSchemaExtractor.
+     * Recebe o ID do cabeçalho e o JSON limpo (sem truncamento) para processamento.
+     * @param commissionStatementId ID do CommissionStatement (cabeçalho) para vincular as linhas.
+     * @param jsonString O JSON completo recebido.
+     */
+    public static void processJsonData(Id commissionStatementId, String jsonString) {
+        
+        List<CommissionStatementLineItem> lineItemsToInsert = new List<CommissionStatementLineItem>();
+
+        try {
+            // Deserializar o JSON
+            CommissionStatementWrapper data = (CommissionStatementWrapper) JSON.deserialize(jsonString, CommissionStatementWrapper.class);
+            
+            System.debug('data: ' + data);
+            
+            if (data.CommissionLineItems != null && data.CommissionLineItems.value != null && !data.CommissionLineItems.value.isEmpty()) {
+                
+                // Iterar sobre os itens de linha
+                for (CommissionLineItemInnerWrapper innerItem : data.CommissionLineItems.value) {
+                    
+                    // --- Proteção contra itens malformados ---
+                    if (innerItem.value == null) {
+                        System.debug('⚠️ Alerta: Item de linha interno (innerItem.value) nulo. Pulando registro.');
+                        continue;
+                    }
+                    
+                    CommissionLineItemData item = innerItem.value;
+                    
+                    // --- Conversões necessárias com proteção contra NullPointerException ---
+                    Decimal commissionAmount = convertToDecimal(item.ValueAmount != null ? item.ValueAmount.value : null);
+                    Decimal commissionRate = convertToDecimal(item.CommissionPercent != null ? item.CommissionPercent.value : null);
+                    Date paymentDate = convertToDate(item.PaymentDate != null ? item.PaymentDate.value : null);
+                    
+					System.debug('innerItem: ' + innerItem);
+                    
+                    // --- Criação do Registro CommissionStatementLineItem ---
+                    CommissionStatementLineItem newLineItem = new CommissionStatementLineItem(
+                        // CAMPO ESSENCIAL: ID recebido do Flow via ConfiguredSchemaExtractor
+                        CommissionStatementId = commissionStatementId,
+                        
+                        // Campos de mapeamento (ajustados para serem defensivos contra valores nulos)
+						TransactionDate  = paymentDate,
+						InsurancePolicyNumber  = item.PolicyNumber != null ? item.PolicyNumber.value : null,
+						EndorssmentNumber__c = item.EndorssementNumber != null ? item.EndorssementNumber.value : null,
+						InstallmentNumber__c = item.InstallmentNumber != null ? item.InstallmentNumber.value : null,
+						CommissionPercent = commissionRate,
+						CommissionType__c = item.CommissionType != null ? item.CommissionType.value : null,
+						CommissionAmount  = commissionAmount,
+						CurrencyIsoCode = item.CommissionCurrencyISOCode != null ? item.CommissionCurrencyISOCode.value : null,
+                        CarrierAccountName = data.CarrierName.value,
+                        ClientAccountName = item.CustomerName.value
+                    );
+                    
+                    lineItemsToInsert.add(newLineItem);
+                }
+                
+                // Inserir os registros
+                if (!lineItemsToInsert.isEmpty()) {
+                    insert lineItemsToInsert;
+                }
+            }
+
+        } catch (Exception e) {
+            System.debug('🚨 ERRO FATAL no processamento JSON: ' + e.getMessage() + ' na linha: ' + e.getLineNumber() + '. JSON: ' + jsonString);
+            // Lança uma exceção para que a classe chamadora (ConfiguredSchemaExtractor) possa retornar a falha ao Flow
+            throw new AuraHandledException('Erro ao processar o JSON e criar linhas: ' + e.getMessage());
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. MÉTODOS AUXILIARES DE CONVERSÃO DE FORMATO
+    // -------------------------------------------------------------------------
+
+    /**
+     * Converte String com formato brasileiro (ex: "1.000,50") para Decimal (Currency).
+     */
+    private static Decimal convertToDecimal(String stringValue) {
+        if (String.isBlank(stringValue)) {
+            return null;
+        }
+        // Remove separador de milhar (ponto) e troca separador decimal (vírgula) por ponto.
+        stringValue = stringValue.replaceAll('\\.', '').replace(',', '.').trim();
+        try {
+            return Decimal.valueOf(stringValue);
+        } catch (Exception e) {
+            System.debug('Erro ao converter para Decimal: ' + stringValue);
+            return null;
+        }
+    }
+
+    /**
+     * Converte String no formato DD/MM/AAAA para Date.
+     */
+    private static Date convertToDate(String dateString) {
+        if (String.isBlank(dateString)) {
+            return null;
+        }
+        try {
+            List<String> parts = dateString.split('/');
+            if (parts.size() == 3) {
+                Integer day = Integer.valueOf(parts[0]);
+                Integer month = Integer.valueOf(parts[1]);
+                Integer year = Integer.valueOf(parts[2]);
+                return Date.newInstance(year, month, day);
+            }
+            return null;
+        } catch (Exception e) {
+            System.debug('Erro ao converter para Date: ' + dateString);
+            return null;
+        }
+    }
+}
