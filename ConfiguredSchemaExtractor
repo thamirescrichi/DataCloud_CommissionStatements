@@ -1,0 +1,146 @@
+/**
+ * @description Invocable Apex class that calls a pre-configured Document AI schema in Data Cloud.
+ * It performs a single, direct call to the extract-data API endpoint using the provided schema name.
+ * This is recommended for documents with known, consistent structures.
+ *
+ * @version 1.0
+ * @see https://developer.salesforce.com/docs/data/connectapi/references/spec?meta=postDocumentAlConfigExtractData
+ */
+public with sharing class ConfiguredSchemaExtractor {
+
+    // --- Input variables required from the Flow ---
+    public class DocumentRequest {
+        @InvocableVariable(label='Content Document ID' description='The ID of the Salesforce File (ContentDocument) to process.' required=true)
+        public Id contentDocumentId;
+        
+        @InvocableVariable(label='Configuration API Name' description='The API Name of the pre-configured Document AI schema to use.' required=true)
+        public String configurationName;
+        
+        @InvocableVariable(label='Named Credential' description='API Name of the Named Credential for the Data Cloud endpoint.' required=true)
+        public String namedCredentialName;
+        
+        @InvocableVariable(label='CommissionStatementId' description='CommissionStatementId.' required=true)
+        public Id commissionStatementId;
+        
+    }
+
+    // --- Output variables returned to the Flow ---
+    public class DocumentResult {
+       // @InvocableVariable(label='Extracted JSON Data' description='The JSON data extracted from the document.')
+        public String extractedJson;
+        
+        @InvocableVariable(label='Error Message' description='Error message if the process failed.')
+        public String errorMessage;
+        
+        @InvocableVariable(label='Is Success' description='True if the process completed successfully.')
+        public Boolean isSuccess;
+    }
+
+    // --- Wrapper classes for deserializing the API response ---
+    private class ExtractDataResponse {
+        public List<ExtractionResult> data;
+        public String error;
+    }
+    private class ExtractionResult {
+        public String data; // This contains the inner, encoded JSON string of extracted data
+        public String error;
+    }
+
+    @InvocableMethod(label='Extract Data with Pre-configured Schema' description='Extracts data from a document using a named Document AI configuration.')
+    public static List<DocumentResult> extractData(List<DocumentRequest> requests) {
+        DocumentRequest request = requests[0];
+        DocumentResult result = new DocumentResult();
+
+        try {
+            // Check for FLS on ContentVersion before querying
+            if (!Schema.sObjectType.ContentVersion.isAccessible()) {
+                throw new SecurityException('Insufficient permissions to access ContentVersion object.');
+            }
+            
+            // Get the file data from the ContentDocument ID
+            ContentVersion cv = [SELECT VersionData, FileExtension FROM ContentVersion WHERE ContentDocumentId = :request.contentDocumentId AND IsLatest = true LIMIT 1];
+            
+            // Prepare the HTTP request
+            HttpRequest req = new HttpRequest();
+            // Use the Named Credential provided by the Flow
+            req.setEndpoint('callout:' + request.namedCredentialName + '/services/data/v64.0/ssot/document-processing/actions/extract-data');
+            req.setMethod('POST');
+            req.setHeader('Content-Type', 'application/json');
+            req.setTimeout(120000); // 2-minute timeout
+
+            // Build the request body for the extract-data API
+            Map<String, Object> filePayload = new Map<String, Object>{
+                'data' => EncodingUtil.base64Encode(cv.VersionData), // Base64 encoded file data 
+                'mimeType' => getMimeTypeFromExtension(cv.FileExtension) // File MIME type 
+            };
+        
+            Map<String, Object> bodyMap = new Map<String, Object>{
+                'idpConfigurationIdOrName' => request.configurationName, // Use the schema API name from the Flow input 
+                'files' => new List<Object>{ filePayload } // Array containing the file payload 
+            };
+            
+            req.setBody(JSON.serialize(bodyMap));
+            
+            // Send the request and process the response
+            HttpResponse res = new Http().send(req);
+
+            if (res.getStatusCode() >= 200 && res.getStatusCode() < 300) {
+                ExtractDataResponse responseWrapper = (ExtractDataResponse) JSON.deserialize(res.getBody(), ExtractDataResponse.class); 
+                
+                System.debug('responseWrapper: ' + responseWrapper);
+                if (responseWrapper.data != null && !responseWrapper.data.isEmpty()) {
+                    ExtractionResult extraction = responseWrapper.data[0];
+                    String innerData = extraction.data; // JSON com escape HTML
+                    
+                    if (String.isNotBlank(innerData)) {
+                        String jsonPayload = innerData.unescapeHtml4(); // JSON final limpo
+                        
+                        // 4. CHAMADA DIRETA AO PARSER APEX (Sem retornar ao Flow!)
+                        // Esta é a correção para o problema de truncamento do JSON.
+                        result.extractedJson = jsonPayload;
+                        
+                        CommissionStatement cs = [SELECT Id, JSON_File__c FROM CommissionStatement WHERE Id =: request.commissionStatementId];
+                        cs.JSON_File__c = jsonPayload;
+                        update cs;
+                        
+                        System.debug('jsonPayload: ' + jsonPayload);
+                        parseJSONDataCloudCommission2.processJsonData(request.commissionStatementId, jsonPayload);
+                        
+                        result.isSuccess = true;
+                    } else {
+                        // Extração técnica OK, mas sem dados JSON.
+                        result.isSuccess = true; 
+                        result.errorMessage = 'Extração concluída, mas o JSON de dados está vazio.';
+                    }
+                } else {
+                    result.isSuccess = false;
+                    result.errorMessage = 'Extração falhou. A resposta da API não continha dados (responseWrapper.data é nulo ou vazio).';
+                }
+            } else {
+                result.isSuccess = false;
+                result.errorMessage = 'Erro HTTP da API. Status: ' + res.getStatusCode() + ' Body: ' + res.getBody();
+            }
+        } catch (Exception e) {
+            System.debug('erro: ' + e.getMessage());
+            result.isSuccess = false;
+            // Se o erro ocorreu no parseJSONDataCloudCommission, ele estará aqui.
+            result.errorMessage = 'Erro Apex durante a extração/processamento: ' + e.getMessage() + ' | Stack Trace: ' + e.getStackTraceString();
+        }
+
+        return new List<DocumentResult>{ result };
+    }
+
+    // --- Helper method to determine the file's MIME type ---
+    private static String getMimeTypeFromExtension(String extension) {
+        if (String.isBlank(extension)) { 
+            return 'application/octet-stream'; 
+        }
+        String ext = extension.toLowerCase();
+        if (ext == 'pdf') { return 'application/pdf'; }
+        if (ext == 'png') { return 'image/png'; }
+        if (ext == 'jpg' || ext == 'jpeg') { return 'image/jpeg'; }
+        
+        // Default for unknown types
+        return 'application/octet-stream';
+    }
+}
